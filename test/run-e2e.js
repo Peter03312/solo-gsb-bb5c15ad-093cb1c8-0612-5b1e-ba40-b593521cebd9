@@ -73,6 +73,22 @@ async function main() {
     });
     await waitForServer();
     await run('history.e2e.js');
+    // 引用影响链套件：先停掉历史套件的服务，再换空库
+    server3.kill();
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(tmpDb, { force: true });
+    for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
+    const server4 = spawn(process.execPath, [path.join(root, 'src/server.js')], {
+      cwd: root,
+      env: { ...process.env, DB_PATH: tmpDb, PORT: port },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    await waitForServer();
+    try {
+      await run('impact.e2e.js');
+    } finally {
+      server4.kill();
+    }
     console.log('\n端到端测试全部通过');
   } catch (err) {
     console.error(err.message);

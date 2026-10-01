@@ -509,6 +509,185 @@ function scheduleNeighbors(pending, versionId) {
   return { before, after };
 }
 
+// ---------------------------------------------------------------------------
+// 草案引用影响链（只读分析）
+//
+// 以“草案按现有规则重放后的候选版本 C”与“最新发布版 L”比较：
+//   变化源 = 相对 L 标题、正文、出站引用发生变化，或被删除的条款（新增条款不是变化源）。
+// 对每个变化源，分别沿 L、C 各自的反向引用（引用该条款的条款 -> …）BFS：
+//   - 合并展示候选版中仍存在的受影响条款；
+//   - 直接/间接关系由最短引用链长度决定（1 跳为直接，其余间接）；
+//   - 变化前、变化后的链分别计算、分别展示——绝不把两版的引用拼成一条链；
+//   - BFS 每节点每次遍历只访问一次：循环引用不会重复，也不会死循环。
+// ---------------------------------------------------------------------------
+
+// 反向邻接表：target -> [{key: source, label}]（同对节点的并行引用按原顺序全部保留）
+function reverseAdjacency(state) {
+  const adj = new Map();
+  for (const e of state.edges) {
+    if (!adj.has(e.target)) adj.set(e.target, []);
+    adj.get(e.target).push({ key: e.source, label: e.label || '' });
+  }
+  return adj;
+}
+
+// 从 sourceKey 沿反向引用 BFS。
+// 返回 Map<受影响条款, { distance, hops }>（不含 sourceKey 自身）。
+// hops 为实际引用边、按“受影响条款 -> … -> 变化源”排列：
+//   hops[0].source 是受影响条款，hops[hops.length-1].target 是变化源；
+// BFS 首次到达即最短路径；同一节点再次被遇到（循环）直接跳过，不重复不入队。
+function reverseReachable(state, sourceKey) {
+  const adj = reverseAdjacency(state);
+  const parent = new Map(); // 到达节点 -> { parentKey, label }
+  const dist = new Map([[sourceKey, 0]]);
+  const queue = [sourceKey];
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++];
+    for (const back of adj.get(cur) || []) {
+      if (dist.has(back.key)) continue; // 已到达（含回到起点/绕环回返）：循环不重复
+      dist.set(back.key, dist.get(cur) + 1);
+      parent.set(back.key, { parentKey: cur, label: back.label });
+      queue.push(back.key);
+    }
+  }
+  const out = new Map();
+  for (const [key, distance] of dist) {
+    if (key === sourceKey) continue;
+    const hops = [];
+    let cur = key;
+    while (cur !== sourceKey) {
+      const p = parent.get(cur);
+      hops.push({ source: cur, target: p.parentKey, label: p.label });
+      cur = p.parentKey;
+    }
+    out.set(key, { distance, hops });
+  }
+  return out;
+}
+
+// 变化源：候选版相对最新发布版，标题/正文/出站引用变化或删除的条款。
+// 仅在候选版自身无悬空引用时调用（发布/影响链查询都会先拦截悬空）。
+function impactChangeSources(latest, candidate) {
+  const sources = [];
+  for (const key of latest.order) {
+    const l = latest.clauses.get(key);
+    const c = candidate.clauses.get(key);
+    if (!c) {
+      sources.push({
+        key,
+        kinds: ['deleted'],
+        title_before: l.title,
+        title_after: null,
+        refs_added: [],
+        refs_removed: edgesOf(latest, key).map((e) => ({ ...e })),
+      });
+      continue;
+    }
+    const kinds = [];
+    if (l.title !== c.title) kinds.push('title');
+    if (l.body !== c.body) kinds.push('body');
+    const oldEdges = edgesOf(latest, key);
+    const newEdges = edgesOf(candidate, key);
+    const oldSet = new Set(oldEdges.map(edgeKey));
+    const newSet = new Set(newEdges.map(edgeKey));
+    const refsAdded = newEdges.filter((e) => !oldSet.has(edgeKey(e))).map((e) => ({ ...e }));
+    const refsRemoved = oldEdges.filter((e) => !newSet.has(edgeKey(e))).map((e) => ({ ...e }));
+    if (refsAdded.length || refsRemoved.length) kinds.push('refs');
+    if (kinds.length) {
+      sources.push({
+        key,
+        kinds,
+        title_before: l.title,
+        title_after: c.title,
+        refs_added: refsAdded,
+        refs_removed: refsRemoved,
+      });
+    }
+  }
+  return sources;
+}
+
+function bestVia(vias, side) {
+  const cand = vias.filter((v) => v.side === side);
+  if (!cand.length) return null;
+  return cand.reduce((best, v) => {
+    if (
+      v.distance < best.distance ||
+      (v.distance === best.distance && v.source < best.source)
+    ) {
+      return v;
+    }
+    return best;
+  });
+}
+
+function viaView(v) {
+  return v
+    ? { source: v.source, distance: v.distance, relation: v.distance === 1 ? 'direct' : 'indirect', hops: v.hops }
+    : null;
+}
+
+// 合并双版本反向追溯结果。
+// 入参 latest（最新发布版）、candidate（重放候选版；基线即最新版时为草案当前状态）。
+function referenceImpact({ latest, candidate }) {
+  const sources = impactChangeSources(latest, candidate);
+  const sourceKeys = new Set(sources.map((s) => s.key));
+  // agg: 受影响条款 -> 按 “版本侧 + 变化源” 去重的最短链集合
+  const agg = new Map();
+  for (const s of sources) {
+    const runs = [['before', reverseReachable(latest, s.key)]];
+    // 删除源在候选版中已无节点，变化后侧不存在追溯起点
+    if (!s.kinds.includes('deleted')) runs.push(['after', reverseReachable(candidate, s.key)]);
+    for (const [side, reach] of runs) {
+      for (const [key, r] of reach) {
+        if (side === 'after' && !candidate.clauses.has(key)) continue;
+        if (!agg.has(key)) agg.set(key, []);
+        agg.get(key).push({ side, source: s.key, distance: r.distance, hops: r.hops });
+      }
+    }
+  }
+
+  const affected = [];
+  for (const [key, vias] of agg) {
+    // 仅展示候选版中仍存在的条款；变化前可达、变化后已删除的条款本身必为删除源，
+    // 已在 sources 中列出，不重复作为受影响条款。
+    if (!candidate.clauses.has(key)) continue;
+    const before = viaView(bestVia(vias, 'before'));
+    const after = viaView(bestVia(vias, 'after'));
+    // 总体最短链：变化后优先（它描述当前候选版结构），其次变化前
+    const shortest = after || before;
+    let status = 'still-referring';
+    if (!before) status = 'added-chain';
+    else if (!after) status = 'broken-after';
+    affected.push({
+      key,
+      title: candidate.clauses.get(key).title,
+      exists_before: latest.clauses.has(key),
+      is_added: !latest.clauses.has(key),
+      is_source: sourceKeys.has(key),
+      status, // still-referring | added-chain（候选版新增引用链）| broken-after（变化前有链、变化后断开）
+      relation: shortest.distance === 1 ? 'direct' : 'indirect',
+      shortest_side: after ? 'after' : 'before',
+      shortest_distance: shortest.distance,
+      shortest_chain: shortest.hops,
+      source_keys: [...new Set(vias.map((v) => v.source))].sort(),
+      before,
+      after,
+    });
+  }
+  // 直接在前、间接在后；同距离按标识排序，输出稳定
+  affected.sort((a, b) => a.shortest_distance - b.shortest_distance || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+  const stats = {
+    source_count: sources.length,
+    affected_count: affected.length,
+    direct_count: affected.filter((a) => a.relation === 'direct').length,
+    indirect_count: affected.filter((a) => a.relation === 'indirect').length,
+  };
+  return { sources, affected, stats };
+}
+
 function buildState({ order, clauses, edges }) {
   return {
     order: [...order],
@@ -532,4 +711,8 @@ module.exports = {
   pickEffectiveVersion,
   pendingVersions,
   scheduleNeighbors,
+  reverseAdjacency,
+  reverseReachable,
+  impactChangeSources,
+  referenceImpact,
 };

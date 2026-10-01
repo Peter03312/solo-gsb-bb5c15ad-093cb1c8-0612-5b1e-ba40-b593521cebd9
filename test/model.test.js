@@ -10,6 +10,9 @@ const {
   diffStates,
   movedKeys,
   textDiff,
+  reverseReachable,
+  impactChangeSources,
+  referenceImpact,
 } = require('../src/model');
 
 let passed = 0;
@@ -281,6 +284,222 @@ test('scheduleNeighbors：按发布版顺序找相邻待生效版本', () => {
     Object.fromEntries(Object.entries(scheduleNeighbors(q, 7)).map(([k, v]) => [k, v?.id ?? null])),
     { before: 4, after: null },
   );
+});
+
+// ---------------------------------------------------------------------------
+// 草案引用影响链
+// ---------------------------------------------------------------------------
+function impactFixture() {
+  // 最新发布版：B→A（参见），C→B，D→C，E 独立
+  const latest = S(
+    ['A', 'B', 'C', 'D', 'E'],
+    [['A', '总则'], ['B', '会员'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [
+      { source: 'B', target: 'A', label: '参见' },
+      { source: 'C', target: 'B', label: '见B' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  return latest;
+}
+
+test('impactChangeSources：标题/正文/出站引用变化与删除分类，纯位置移动不是变化源', () => {
+  const latest = impactFixture();
+  const candidate = S(
+    ['A', 'B', 'C', 'E', 'D'], // D 仅移动位置
+    [
+      ['A', '总则新标题', '总则'], // 标题
+      ['B', '会员', '会员改写'], // 正文 + 删除 B→A，新增 B→E
+      ['C', '退出'],
+      ['D', '纪律'],
+      ['E', '经费'],
+    ],
+    [
+      { source: 'B', target: 'E', label: '经费依据' },
+      { source: 'C', target: 'B', label: '见B' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  const srcs = impactChangeSources(latest, candidate);
+  const byKey = Object.fromEntries(srcs.map((s) => [s.key, s]));
+  assert.deepStrictEqual(byKey.A.kinds, ['title']);
+  assert.deepStrictEqual(byKey.B.kinds, ['body', 'refs']);
+  assert.deepStrictEqual(byKey.B.refs_added, [{ source: 'B', target: 'E', label: '经费依据' }]);
+  assert.deepStrictEqual(byKey.B.refs_removed, [{ source: 'B', target: 'A', label: '参见' }]);
+  assert.strictEqual(byKey.D, undefined); // 纯移动不算变化源
+  assert.strictEqual(byKey.E, undefined); // 被新引用指向但自身未变，不是变化源
+});
+
+test('新增条款不是变化源；删除条款是变化源', () => {
+  const latest = impactFixture();
+  // 仅新增 F（无入边/出边），不删除任何条款
+  const candidate = S(
+    ['A', 'B', 'C', 'D', 'E', 'F'],
+    [['A', '总则'], ['B', '会员'], ['C', '退出'], ['D', '纪律'], ['E', '经费'], ['F', '附则新增']],
+    [
+      { source: 'B', target: 'A', label: '参见' },
+      { source: 'C', target: 'B', label: '见B' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  assert.deepStrictEqual(impactChangeSources(latest, candidate), []);
+
+  // 删除 B：B 是删除源；引用 B 的 C→B 若同时删除，C 的出站引用也变化（真实重放候选必须如此才不悬空）
+  const candidate2 = S(
+    ['A', 'C', 'D', 'E'],
+    [['A', '总则'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [{ source: 'D', target: 'C', label: '' }],
+  );
+  const keys2 = impactChangeSources(latest, candidate2).map((s) => s.key);
+  assert.deepStrictEqual(keys2.sort(), ['B', 'C']);
+  assert.deepStrictEqual(impactChangeSources(latest, candidate2).find((s) => s.key === 'B').kinds, ['deleted']);
+});
+
+test('reverseReachable：反向 BFS 返回最短链，hops 按受影响条款→变化源排列', () => {
+  const latest = impactFixture();
+  const reach = reverseReachable(latest, 'A');
+  assert.strictEqual(reach.get('B').distance, 1);
+  assert.deepStrictEqual(reach.get('B').hops, [{ source: 'B', target: 'A', label: '参见' }]);
+  assert.strictEqual(reach.get('C').distance, 2);
+  assert.deepStrictEqual(reach.get('C').hops, [
+    { source: 'C', target: 'B', label: '见B' },
+    { source: 'B', target: 'A', label: '参见' },
+  ]);
+  assert.strictEqual(reach.get('D').distance, 3);
+  assert.ok(!reach.has('E'));
+  assert.ok(!reach.has('A')); // 不含变化源自身
+});
+
+test('reverseReachable：循环引用不重复、不死循环，取最短链', () => {
+  const cyc = S(
+    ['A', 'B', 'C'],
+    [['A', 'a'], ['B', 'b'], ['C', 'c']],
+    [
+      { source: 'B', target: 'A' },
+      { source: 'C', target: 'B' },
+      { source: 'A', target: 'C' }, // A→C→B→A 成环
+    ],
+  );
+  const reach = reverseReachable(cyc, 'A');
+  assert.deepStrictEqual([...reach.keys()].sort(), ['B', 'C']);
+  assert.strictEqual(reach.get('B').distance, 1);
+  assert.strictEqual(reach.get('C').distance, 2); // 不绕环；A 不经环回到自身
+});
+
+test('referenceImpact：合并双版本追溯，直接/间接、变化前与变化后链分别给出', () => {
+  const latest = impactFixture();
+  // 候选：仅修改 A 正文，引用结构完全不变 -> 唯一变化源 A；两版追溯结果都在
+  const candidate = S(
+    ['A', 'B', 'C', 'D', 'E'],
+    [['A', '总则', 'AA改'], ['B', '会员'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [
+      { source: 'B', target: 'A', label: '参见' },
+      { source: 'C', target: 'B', label: '见B' },
+      { source: 'D', target: 'C', label: '' },
+    ],
+  );
+  const r = referenceImpact({ latest, candidate });
+  assert.deepStrictEqual(r.sources.map((s) => s.key), ['A']);
+  const keys = new Map(r.affected.map((a) => [a.key, a]));
+  assert.deepStrictEqual([...keys.keys()].sort(), ['B', 'C', 'D']);
+  const b = keys.get('B');
+  assert.strictEqual(b.relation, 'direct');
+  assert.strictEqual(b.before.distance, 1);
+  assert.strictEqual(b.after.distance, 1);
+  assert.strictEqual(b.status, 'still-referring');
+  const c = keys.get('C');
+  assert.strictEqual(c.relation, 'indirect');
+  assert.strictEqual(c.before.distance, 2);
+  assert.strictEqual(c.after.distance, 2);
+  // 最短链只包含同一版本的引用（变化后链即候选版链），不会跨版本拼接
+  assert.deepStrictEqual(c.shortest_chain.map((h) => `${h.source}>${h.target}#${h.label}`), ['C>B#见B', 'B>A#参见']);
+  const d = keys.get('D');
+  assert.strictEqual(d.shortest_distance, 3);
+  assert.strictEqual(r.stats.direct_count, 1);
+  assert.strictEqual(r.stats.indirect_count, 2);
+});
+
+test('referenceImpact：变化后断开的入边标记 broken-after，链只取变化前一侧', () => {
+  const latest = impactFixture();
+  // 候选：A 修改；B→A 与 C→B 一并删除（B 自身出边变化也是源），D→C 保留
+  const candidate = S(
+    ['A', 'B', 'C', 'D', 'E'],
+    [['A', '总则', 'AA改'], ['B', '会员'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [{ source: 'D', target: 'C', label: '' }],
+  );
+  const r = referenceImpact({ latest, candidate });
+  const c = r.affected.find((a) => a.key === 'C');
+  assert.ok(c, '变化前引用 B 的 C 仍作为受影响条款展示');
+  // C→B（B 是引用变化源）为 1 跳；变化后 C→B 已删，链断
+  assert.strictEqual(c.before.distance, 1);
+  assert.strictEqual(c.after, null, '变化后 C 已无法经引用到达任何变化源');
+  assert.strictEqual(c.status, 'broken-after');
+  assert.strictEqual(c.relation, 'direct');
+  assert.deepStrictEqual(c.shortest_chain.map((h) => h.target), ['B']);
+  // D→C：C 自身是变化源（删除了 C→B），故 D 直接引用变化源 C，前后都在
+  const d = r.affected.find((a) => a.key === 'D');
+  assert.ok(d);
+  assert.strictEqual(d.before.distance, 1);
+  assert.strictEqual(d.after.distance, 1);
+  assert.strictEqual(d.status, 'still-referring');
+});
+
+test('referenceImpact：变化后新增的引用链标记 added-chain，变化后仍可达优先取变化后链', () => {
+  const latest = impactFixture();
+  // 候选：A 修改；E 新增 E→A；B→A 保留
+  const candidate = S(
+    ['A', 'B', 'C', 'D', 'E'],
+    [['A', '总则', 'AA改'], ['B', '会员'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [
+      { source: 'B', target: 'A', label: '参见' },
+      { source: 'C', target: 'B', label: '见B' },
+      { source: 'D', target: 'C', label: '' },
+      { source: 'E', target: 'A', label: '' },
+    ],
+  );
+  const r = referenceImpact({ latest, candidate });
+  const keys = new Map(r.affected.map((a) => [a.key, a]));
+  const e = keys.get('E');
+  assert.ok(e, '新增引用 E→A 使候选版既有条款 E 受影响');
+  assert.strictEqual(e.before, null);
+  assert.strictEqual(e.after.distance, 1);
+  assert.strictEqual(e.status, 'added-chain');
+  assert.strictEqual(e.relation, 'direct');
+  const b = keys.get('B');
+  assert.strictEqual(b.shortest_side, 'after'); // 变化后仍可达：优先变化后
+  assert.deepStrictEqual(b.shortest_chain, [{ source: 'B', target: 'A', label: '参见' }]);
+});
+
+test('referenceImpact：删除的条款不作为受影响条款（已在变化源中列出）', () => {
+  // 独立小图：X→Y（Y 被 X 引用）；候选删除 X。X 无入边，删除不改变其他条款出边。
+  const latest = S(
+    ['X', 'Y'],
+    [['X', '经费'], ['Y', '审计']],
+    [{ source: 'X', target: 'Y', label: '' }],
+  );
+  const candidate = S(['Y'], [['Y', '审计']], []);
+  const r = referenceImpact({ latest, candidate });
+  assert.deepStrictEqual(r.sources.map((s) => s.key), ['X']);
+  assert.ok(!r.affected.some((a) => a.key === 'X'), '删除源不重复出现在受影响列表');
+  assert.ok(!r.affected.some((a) => a.key === 'Y') || r.affected.find((a) => a.key === 'Y').after === null,
+    'Y 即使被列为受影响条款，变化后侧也无链');
+});
+
+test('referenceImpact：删除被引用条款且入边一并清理时，旧入边来源标记 broken-after', () => {
+  const latest = impactFixture();
+  // 候选：删除 B；C→B 一并删除（否则候选悬空）。B 无其他入边。
+  const candidate = S(
+    ['A', 'C', 'D', 'E'],
+    [['A', '总则'], ['C', '退出'], ['D', '纪律'], ['E', '经费']],
+    [{ source: 'D', target: 'C', label: '' }],
+  );
+  const r = referenceImpact({ latest, candidate });
+  assert.ok(r.sources.some((s) => s.key === 'B' && s.kinds.includes('deleted')));
+  assert.ok(!r.affected.some((a) => a.key === 'B'), '删除条款不作为受影响条款');
+  const c = r.affected.find((a) => a.key === 'C');
+  assert.ok(c, '变化前引用 B 的 C 仍作为受影响条款展示');
+  assert.strictEqual(c.after, null);
+  assert.strictEqual(c.status, 'broken-after');
 });
 
 console.log(`\n${passed} 项测试全部通过`);

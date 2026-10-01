@@ -451,6 +451,11 @@ function renderDraft() {
         },
       }, '保存名称'),
       el('button', {
+        class: 'btn secondary small',
+        onclick: () => openImpact(d.id),
+        title: '把草案按现有规则重放为候选版本，沿两版反向引用追溯受影响条款（只读）',
+      }, '🔗 引用影响链'),
+      el('button', {
         class: d.publishable && d.status === 'open' ? 'btn' : 'btn',
         disabled: !d.publishable || d.status !== 'open',
         onclick: () => openPublish(d.id),
@@ -838,6 +843,162 @@ function openDiffDetail(d) {
     for (const r of diff.refs_added || []) body.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
   }
   modal({ title: `相对基线 v${d.baseline_id} 的差异`, body, wide: true, footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')] });
+}
+
+// ---------------------------------------------------------------------------
+// 引用影响链（只读）：草案重放候选版本 vs 最新发布版，沿两版反向引用追溯
+// ---------------------------------------------------------------------------
+// 引用链 hops（实际引用边，按“受影响条款 -> … -> 变化源”）渲染为一串引用标签。
+function renderRefChain(hops) {
+  if (!hops || !hops.length) return el('span', { class: 'muted small' }, '（无）');
+  const parts = [];
+  hops.forEach((h, i) => {
+    if (i > 0) parts.push(' ');
+    parts.push(el('span', { class: 'key-chip' }, h.source));
+    parts.push(el('span', { class: 'muted' }, '→'));
+    if (i === hops.length - 1) parts.push(el('span', { class: 'key-chip' }, h.target));
+  });
+  return el('span', { style: 'display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap' }, ...parts);
+}
+
+function renderOneChain(v) {
+  if (!v) return el('span', { class: 'muted small' }, '本版无反向引用链（该侧不受影响）');
+  return el('div', { style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:3px' },
+    el('span', { class: `badge ${v.relation === 'direct' ? 'warn' : 'neutral'}` },
+      v.distance === 1 ? '直接引用' : `间接引用（${v.distance} 跳）`),
+    renderRefChain(v.hops),
+  );
+}
+
+function impactKindBadges(kinds) {
+  const map = { title: ['标题修改', 'warn'], body: ['正文修改', 'warn'], refs: ['出站引用变化', 'neutral'], deleted: ['条款删除', 'err'] };
+  return kinds.map((k) => el('span', { class: `badge ${map[k][1]}`, style: 'margin-left:6px' }, map[k][0]));
+}
+
+async function openImpact(draftId) {
+  modal({
+    title: '引用影响链（只读分析）',
+    wide: true,
+    body: el('div', {},
+      el('div', { class: 'muted small' }, '正在以最新发布版为对照，按现有规则重放草案并追溯反向引用…'),
+    ),
+    footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')],
+  });
+  try {
+    const p = await api('GET', `/api/drafts/${draftId}/impact`);
+    renderImpactModal(p);
+  } catch (e) {
+    renderImpactBlocked(e.payload || { error: 'ERROR', message: e.message });
+  }
+}
+
+function renderImpactBlocked(p) {
+  const body = el('div', {});
+  body.appendChild(el('div', { class: 'issue error' }, el('span', {}, '⛔'),
+    el('div', {},
+      el('div', {}, el('strong', {}, '无法给出引用影响结论')),
+      el('div', { class: 'small muted' }, p.message || '草案重放为候选版本时被拒绝，草案已原样保留。'),
+    )));
+  if (p.issues?.length) body.appendChild(renderIssueList(p.issues));
+  if (p.conflicts?.length || p.dangling?.length) body.appendChild(renderPublishConflict(p));
+  const ctx = el('div', { class: 'muted small', style: 'margin-top:10px' });
+  if (p.draft_revision != null) {
+    ctx.appendChild(document.createTextNode(`草案修订号 #${p.draft_revision} · 最新发布版 v${p.latest_version_id} · 基线 v${p.baseline_id} · 查询时刻 ${fmtTime(p.queried_at)}`));
+  }
+  body.appendChild(ctx);
+  modal({
+    title: '引用影响链（只读分析）',
+    wide: true,
+    body,
+    footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')],
+  });
+}
+
+function renderImpactModal(p) {
+  const body = el('div', {});
+  body.appendChild(el('div', { class: 'issue' }, el('span', {}, '🔗'),
+    el('div', {},
+      el('div', {}, el('strong', {}, '草案重放候选版本相对最新发布版的引用影响链')),
+      el('div', { class: 'small muted' },
+        `变化源为标题、正文、出站引用变化或删除的条款；分别沿变化前（v${p.latest_version_id}）与变化后（候选版本）各自的反向引用追溯。每条链仅取自一个版本，不会把两版引用拼成一条链；循环引用不重复。`),
+    )));
+  body.appendChild(el('div', { class: 'muted small', style: 'margin-bottom:10px' },
+    `草案修订号 #${p.draft_revision} · 最新发布版 v${p.latest_version_id} · 基线 v${p.baseline_id}${p.replayed ? '（基线落后，已按三方规则重放）' : ''} · 查询时刻 ${fmtTime(p.queried_at)}`));
+
+  const chips = [
+    el('span', { class: 'badge warn' }, `变化源 ${p.stats.source_count}`),
+    el('span', { class: 'badge err' }, `受影响条款 ${p.stats.affected_count}`),
+    el('span', { class: 'badge neutral' }, `直接 ${p.stats.direct_count} · 间接 ${p.stats.indirect_count}`),
+  ];
+  body.appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px' }, ...chips));
+
+  if (!p.has_changes) {
+    body.appendChild(el('div', { class: 'empty small' }, '候选版本与最新发布版完全一致：没有变化源，也没有受影响条款。'));
+  }
+
+  // 变化源
+  if (p.sources.length) {
+    body.appendChild(el('h4', {}, '变化源'));
+    for (const s of p.sources) {
+      const node = el('div', { class: 'clause changed-glow' });
+      node.appendChild(el('div', { class: 'clause-hd' },
+        el('span', { class: 'key-chip' }, s.key),
+        el('span', { class: 'title' }, s.kinds.includes('deleted') ? `（已删除）${s.title_before || ''}` : s.title_after),
+        ...impactKindBadges(s.kinds),
+      ));
+      const cb = el('div', { class: 'clause-bd' });
+      if (s.refs_removed?.length) {
+        cb.appendChild(el('div', { class: 'small muted' }, '删除出站引用：'));
+        for (const r of s.refs_removed) cb.appendChild(el('div', {}, el('del', {}, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`)));
+      }
+      if (s.refs_added?.length) {
+        cb.appendChild(el('div', { class: 'small muted', style: 'margin-top:4px' }, '新增出站引用：'));
+        for (const r of s.refs_added) cb.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`)));
+      }
+      node.appendChild(cb);
+      body.appendChild(node);
+    }
+  }
+
+  // 受影响条款
+  if (p.affected.length) {
+    body.appendChild(el('h4', {}, '仍存在的受影响条款（合并变化前后追溯）'));
+    const statusMap = {
+      'still-referring': '变化前后均可达',
+      'broken-after': '变化后引用链已断开',
+      'added-chain': '候选版新增引用链',
+    };
+    for (const a of p.affected) {
+      const node = el('div', { class: 'clause' });
+      node.appendChild(el('div', { class: 'clause-hd' },
+        el('span', { class: 'key-chip' }, a.key),
+        el('span', { class: 'title' }, a.title),
+        el('span', { class: `badge ${a.relation === 'direct' ? 'warn' : 'neutral'}` }, a.relation === 'direct' ? '直接' : `间接 · ${a.shortest_distance} 跳`),
+        a.is_source ? el('span', { class: 'badge open' }, '同时是变化源') : null,
+        a.is_added ? el('span', { class: 'badge ok' }, '候选版新增条款') : null,
+        el('span', { class: 'badge neutral' }, statusMap[a.status] || a.status),
+      ));
+      const cb = el('div', { class: 'clause-bd' });
+      cb.appendChild(el('div', { class: 'small muted' }, `变化前（v${p.latest_version_id}）最短引用链：`));
+      cb.appendChild(renderOneChain(a.before));
+      cb.appendChild(el('div', { class: 'small muted', style: 'margin-top:6px' }, '变化后（候选版本）最短引用链：'));
+      cb.appendChild(renderOneChain(a.after));
+      node.appendChild(cb);
+      body.appendChild(node);
+    }
+    body.appendChild(el('p', { class: 'muted small' },
+      '说明：两条链分别来自变化前、变化后各自的反向引用追溯，不跨版本拼接；标注“本版无反向引用链”表示该版本侧该条款未沿引用指向任何变化源。'));
+  }
+
+  modal({
+    title: '引用影响链（只读分析）',
+    wide: true,
+    body,
+    footer: [
+      el('button', { class: 'btn secondary', onclick: () => openImpact(p.draft_id) }, '重新查询'),
+      el('button', { class: 'btn ghost', onclick: closeModal }, '关闭'),
+    ],
+  });
 }
 
 function openPublish(draftId) {

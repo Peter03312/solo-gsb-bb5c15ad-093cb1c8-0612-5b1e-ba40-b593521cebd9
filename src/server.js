@@ -38,6 +38,7 @@ const {
   pickEffectiveVersion,
   pendingVersions,
   scheduleNeighbors,
+  referenceImpact,
 } = require('./model');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -498,6 +499,119 @@ function handleUndoRedo(draftId, body, direction) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 草案引用影响链（只读）
+// GET /api/drafts/:id/impact
+// 把草案按现有发布规则重放到最新发布版得到候选版本，与最新发布版比较后：
+//   标题/正文/出站引用变化或删除的条款为变化源；分别沿两版各自的反向引用追溯，
+//   合并展示候选版中仍存在的受影响条款、直接/间接关系与最短引用链。
+// 基线落后的草案若自身有必须修复的问题、重放冲突或产生悬空引用，
+// 只说明原因（与发布/预览一致的语义），不返回任何影响结论。
+// 全程只读、不写库；响应携带草案修订号与最新发布版本号——草案再次编辑
+// （修订号变化）或其他草案发布（最新版号变化）后重新查询自然反映新状态。
+// ---------------------------------------------------------------------------
+function handleDraftImpact(draftId) {
+  const meta = getDraftMeta(db, draftId);
+  if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+
+  const versions = listVersions(db);
+  if (!versions.length) {
+    return { status: 409, payload: { error: 'NO_VERSION', message: '还没有任何已发布版本，无引用影响链可分析' } };
+  }
+  const latestVersionId = versions[versions.length - 1].id;
+  const baseCtx = {
+    blocked: true,
+    draft_id: draftId,
+    draft_name: meta.name,
+    draft_status: meta.status,
+    draft_revision: meta.revision,
+    baseline_id: meta.baseline_id,
+    latest_version_id: latestVersionId,
+    queried_at: nowIso(),
+  };
+
+  const draftState = loadDraftState(db, draftId);
+  const draftMoved = new Set(loadDraftMoved(db, draftId));
+
+  // 1) 草案自身的结构问题（悬空引用、空正文等）：无候选版本可言，不给出影响结论。
+  const issues = validateState(draftState).filter((i) => i.level === 'error');
+  if (issues.length) {
+    return {
+      status: 409,
+      payload: {
+        ...baseCtx,
+        error: 'DRAFT_INVALID',
+        reason: 'draft-invalid',
+        message: '草案当前存在必须修复的问题（如悬空引用、空正文），无法按现有规则重放为候选版本，因此不返回影响结论；请先修复草案后重新查询。',
+        issues,
+      },
+    };
+  }
+
+  let candidate = null;
+  let candidateMoved = null;
+  let replayed = false;
+  if (meta.baseline_id === latestVersionId) {
+    candidate = draftState;
+    candidateMoved = new Set(draftMoved);
+  } else {
+    // 基线落后：沿同一套三方重放规则生成候选版本
+    const baselineState = loadVersionState(db, meta.baseline_id);
+    const latestState = loadVersionState(db, latestVersionId);
+    const latestMovedKeys = new Set();
+    for (const v of versions) {
+      if (v.id > meta.baseline_id && v.id <= latestVersionId) {
+        for (const k of v.moved_keys) latestMovedKeys.add(k);
+      }
+    }
+    const result = replayDraft({
+      baseline: baselineState,
+      latest: latestState,
+      draft: draftState,
+      draftMoved,
+      latestMovedKeys,
+    });
+    if (!result.ok) {
+      return {
+        status: 409,
+        payload: {
+          ...baseCtx,
+          error: 'IMPACT_REPLAY_CONFLICT',
+          reason: 'replay-conflict',
+          message: '草案基线落后于最新发布版，按现有规则重放时出现冲突或产生悬空引用，无法确定候选版本，因此不返回影响结论；请按下列原因修改草案后重新查询（草案已原样保留）。',
+          conflicts: result.conflicts,
+          dangling: result.dangling,
+        },
+      };
+    }
+    candidate = result.merged;
+    candidateMoved = result.mergedMoved;
+    replayed = true;
+  }
+
+  const latestState = loadVersionState(db, latestVersionId);
+  const impact = referenceImpact({ latest: latestState, candidate });
+  return {
+    status: 200,
+    payload: {
+      draft_id: draftId,
+      draft_name: meta.name,
+      draft_status: meta.status,
+      draft_revision: meta.revision,
+      baseline_id: meta.baseline_id,
+      latest_version_id: latestVersionId,
+      replayed,
+      has_changes: impact.stats.source_count > 0,
+      queried_at: nowIso(),
+      candidate: serializeState(candidate),
+      candidate_moved_keys: [...candidateMoved].filter((k) => candidate.clauses.has(k)),
+      sources: impact.sources,
+      affected: impact.affected,
+      stats: impact.stats,
+    },
+  };
+}
+
 function draftRoutes(method, url, body, query) {
   const draftMatch = url.match(/^\/api\/drafts\/(\d+)(\/.*)?$/);
   if (!draftMatch) return null;
@@ -538,6 +652,7 @@ function draftRoutes(method, url, body, query) {
   }
 
   if (method === 'GET' && sub === '/history') return handleDraftHistory(draftId);
+  if (method === 'GET' && sub === '/impact') return handleDraftImpact(draftId);
   if (method === 'POST' && sub === '/undo') return handleUndoRedo(draftId, body, 'undo');
   if (method === 'POST' && sub === '/redo') return handleUndoRedo(draftId, body, 'redo');
 
