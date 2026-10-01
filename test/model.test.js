@@ -10,6 +10,7 @@ const {
   diffStates,
   movedKeys,
   textDiff,
+  referenceImpact,
 } = require('../src/model');
 
 let passed = 0;
@@ -280,6 +281,168 @@ test('scheduleNeighbors：按发布版顺序找相邻待生效版本', () => {
   assert.deepStrictEqual(
     Object.fromEntries(Object.entries(scheduleNeighbors(q, 7)).map(([k, v]) => [k, v?.id ?? null])),
     { before: 4, after: null },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 引用影响链
+// ---------------------------------------------------------------------------
+test('引用影响链：正文/出站引用变化条款为变化源，反向追溯直接与最短间接链', () => {
+  // L：X->A（直接），Y->X（间接），A->B 无关节联
+  const latest = S(
+    ['A', 'B', 'X', 'Y'],
+    [['A', '总则'], ['B', '会员'], ['X', '经费'], ['Y', '监督']],
+    [
+      { source: 'X', target: 'A', label: '见' },
+      { source: 'Y', target: 'X', label: '' },
+      { source: 'A', target: 'B', label: '' },
+    ],
+  );
+  // 候选：仅改写 A 正文
+  const candidate = S(
+    ['A', 'B', 'X', 'Y'],
+    [['A', '总则', '总则正文-修订'], ['B', '会员'], ['X', '经费'], ['Y', '监督']],
+    [
+      { source: 'X', target: 'A', label: '见' },
+      { source: 'Y', target: 'X', label: '' },
+      { source: 'A', target: 'B', label: '' },
+    ],
+  );
+  const imp = referenceImpact({ latest, candidate });
+  assert.deepStrictEqual(imp.sources.map((s) => s.key), ['A']);
+  assert.deepStrictEqual(imp.sources[0].changes, { title: false, body: true, outgoing_refs: false });
+  const byKey = Object.fromEntries(imp.affected.map((a) => [a.key, a]));
+  assert.deepStrictEqual(Object.keys(byKey).sort(), ['X', 'Y']);
+  assert.strictEqual(byKey.X.direct, true);
+  assert.deepStrictEqual(byKey.X.relations[0].path.map((n) => n.key), ['X', 'A']);
+  assert.strictEqual(byKey.X.relations[0].edges[0].label, '见');
+  const yRel = byKey.Y.relations.find((r) => r.distance === 2);
+  assert.ok(yRel && !yRel.direct, 'Y 为间接受影响');
+  assert.deepStrictEqual(yRel.path.map((n) => n.key), ['Y', 'X', 'A']);
+  // B 不反向引用 A，不受影响
+  assert.strictEqual(byKey.B, undefined);
+});
+
+test('引用影响链：循环引用不重复、不无限展开', () => {
+  const latest = S(
+    ['A', 'B', 'C'],
+    [['A', '总则'], ['B', '会员'], ['C', '附则']],
+    [
+      { source: 'B', target: 'A', label: '' },
+      { source: 'A', target: 'B', label: '' }, // A<->B 环
+      { source: 'C', target: 'B', label: '' },
+    ],
+  );
+  const candidate = S(
+    ['A', 'B', 'C'],
+    [['A', '总则改'], ['B', '会员'], ['C', '附则']],
+    [
+      { source: 'B', target: 'A', label: '' },
+      { source: 'A', target: 'B', label: '' },
+      { source: 'C', target: 'B', label: '' },
+    ],
+  );
+  const imp = referenceImpact({ latest, candidate });
+  // B 到 A 为直接链（B->A），不应因为环 A->B 而重复出现多条路径
+  const b = imp.affected.find((a) => a.key === 'B');
+  assert.ok(b);
+  assert.strictEqual(b.relations.length, 2); // before / after 各一条
+  assert.deepStrictEqual(b.relations[0].path.map((n) => n.key), ['B', 'A']);
+  const c = imp.affected.find((a) => a.key === 'C');
+  assert.deepStrictEqual(c.relations.find((r) => r.distance === 2).path.map((n) => n.key), ['C', 'B', 'A']);
+});
+
+test('引用影响链：删除源与出站引用变化源；变化前链不拼到变化后，链消失时标注', () => {
+  // L：X->B；候选删除 B（X 不再引用 B，故 X 的出站引用也变化），并改写 A
+  const latest = S(
+    ['A', 'B', 'X'],
+    [['A', '总则'], ['B', '会员'], ['X', '经费']],
+    [{ source: 'X', target: 'B', label: '' }],
+  );
+  const candidate = S(
+    ['A', 'X'],
+    [['A', '总则改'], ['X', '经费']],
+    [],
+  );
+  const imp = referenceImpact({ latest, candidate });
+  const srcB = imp.sources.find((s) => s.key === 'B');
+  assert.strictEqual(srcB.kind, 'deleted');
+  const srcX = imp.sources.find((s) => s.key === 'X');
+  assert.ok(srcX && srcX.changes.outgoing_refs, 'X 出站引用被删除，本身也是变化源');
+  // 变化前 X 沿 X->B 可追到删除源 B，但 X 自身是变化源，不重复列为受影响条款
+  assert.ok(!imp.affected.some((a) => a.key === 'X'));
+});
+
+test('引用影响链：新增条款不是变化源；变化前后两侧关系独立标注', () => {
+  const latest = S(
+    ['A', 'X'],
+    [['A', '总则'], ['X', '经费']],
+    [{ source: 'X', target: 'A', label: '' }],
+  );
+  // 改写 A；新增 D 且 D->A（D 在变化前不存在，但作为受影响条款从变化后图可达）
+  const candidate = S(
+    ['A', 'X', 'D'],
+    [['A', '总则改'], ['X', '经费'], ['D', '新条']],
+    [
+      { source: 'X', target: 'A', label: '' },
+      { source: 'D', target: 'A', label: '' },
+    ],
+  );
+  const imp = referenceImpact({ latest, candidate });
+  assert.deepStrictEqual(imp.sources.map((s) => s.key), ['A']);
+  const keys = imp.affected.map((a) => a.key).sort();
+  assert.deepStrictEqual(keys, ['D', 'X']);
+  const d = imp.affected.find((a) => a.key === 'D');
+  assert.deepStrictEqual(d.sides, ['after']);
+  assert.ok(!d.relations.some((r) => r.side === 'before'), '新增条款 D 在变化前无图，不会拼出跨版链');
+  const x = imp.affected.find((a) => a.key === 'X');
+  assert.deepStrictEqual(x.sides.sort(), ['after', 'before']);
+});
+
+test('引用影响链：纯位置移动不是变化源', () => {
+  const latest = S(['A', 'B'], [['A', '总则'], ['B', '会员']], []);
+  const candidate = S(['B', 'A'], [['A', '总则'], ['B', '会员']], []);
+  const imp = referenceImpact({ latest, candidate });
+  assert.strictEqual(imp.sources.length, 0);
+  assert.strictEqual(imp.affected.length, 0);
+});
+
+test('引用影响链：变化前存在的引用链在候选版被删 -> active_after=false 但仍展示', () => {
+  // L：Z->Y->X->A；候选改写 A，且 X 的出站引用改为删除 X->A（X 自身也是变化源）。
+  // Y、Z 自身内容与出站引用均未变；变化前 Y/Z 沿反向引用可追溯到 A，
+  // 变化后链在 X 处断裂，变化前关系以 active_after=false 保留展示。
+  const latest = S(
+    ['A', 'X', 'Y', 'Z'],
+    [['A', '总则'], ['X', '经费'], ['Y', '监督'], ['Z', '评议']],
+    [
+      { source: 'X', target: 'A', label: '' },
+      { source: 'Y', target: 'X', label: '' },
+      { source: 'Z', target: 'Y', label: '' },
+    ],
+  );
+  const candidate = S(
+    ['A', 'X', 'Y', 'Z'],
+    [['A', '总则', '总则正文-修订'], ['X', '经费'], ['Y', '监督'], ['Z', '评议']],
+    [
+      { source: 'Y', target: 'X', label: '' },
+      { source: 'Z', target: 'Y', label: '' },
+    ],
+  );
+  const imp = referenceImpact({ latest, candidate });
+  assert.ok(imp.sources.some((s) => s.key === 'X' && s.changes.outgoing_refs), '删除 X->A：X 是变化源');
+  const y = imp.affected.find((a) => a.key === 'Y');
+  const z = imp.affected.find((a) => a.key === 'Z');
+  assert.ok(y && z, 'Y、Z 未被直接修改，作为现存受影响条款展示');
+  for (const a of [y, z]) {
+    // 到源 A 的变化前链已断裂（X->A 在候选版被删）
+    const toABefore = a.relations.find((r) => r.source_key === 'A' && r.side === 'before');
+    assert.ok(toABefore, `${a.key} 沿变化前反向引用可追溯到 A`);
+    assert.strictEqual(toABefore.active_after, false);
+    assert.ok(!a.relations.some((r) => r.source_key === 'A' && r.side === 'after'), `${a.key} 变化后无法再到达 A`);
+  }
+  assert.deepStrictEqual(
+    z.relations.find((r) => r.source_key === 'A' && r.side === 'before').path.map((n) => n.key),
+    ['Z', 'Y', 'X', 'A'],
   );
 });
 

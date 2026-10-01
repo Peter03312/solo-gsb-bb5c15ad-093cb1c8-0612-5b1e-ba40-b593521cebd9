@@ -311,3 +311,12 @@ del { background: #f7c9c2; text-decoration: line-through; border-radius: 3px; }
 .history-row.future { opacity: 0.55; }
 .history-seq { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; min-width: 34px; }
 .history-summary { flex: 1; }
+
+/* 引用影响链 */
+.impact-rel-list { display: flex; flex-direction: column; gap: 10px; }
+.impact-rel-head { color: var(--muted); display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.impact-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.impact-chain .impact-source { background: var(--amber-bg); color: var(--amber); font-weight: 700; }
+.impact-chain .gone { text-decoration: line-through; background: var(--red-bg); color: var(--red); }
+.impact-arrow { color: var(--muted); font-size: 12.5px; }
+.impact-arrow.gone { color: var(--red); text-decoration: line-through; }

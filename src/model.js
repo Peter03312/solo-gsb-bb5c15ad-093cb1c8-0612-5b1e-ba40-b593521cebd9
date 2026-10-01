@@ -411,6 +411,176 @@ function diffStates(baseline, other, movedSet) {
 }
 
 // ---------------------------------------------------------------------------
+// 引用影响链
+// 变化前 = 最新发布版 latest，变化后 = 草案按现有规则重放后的候选版 candidate。
+// 变化源：两版间标题、正文或出站引用发生变化的同标识条款，以及被删除的条款
+// （纯位置移动不算；仅在候选版新增的条款在变化前不存在、没有反向引用可追溯，也不算）。
+// 对每个变化源，分别在两版各自的引用图上沿反向边 BFS：
+//   - 同版内的最短引用链，循环引用靠已访问集合去重，不会无限展开或重复计入；
+//   - 两条追溯互不相交：链完全位于同一版的图上，绝不把两版引用拼成一条链；
+//   - 受影响条款只展示在候选版中仍存在的；链上消失的节点/引用以 exists_after 标注。
+// ---------------------------------------------------------------------------
+function buildIncoming(state) {
+  const incoming = new Map(); // target -> [{source,target,label}]（按引用序号稳定排序）
+  state.edges.forEach((e) => {
+    if (!incoming.has(e.target)) incoming.set(e.target, []);
+    incoming.get(e.target).push(e);
+  });
+  return incoming;
+}
+
+// 在单个版本的图上，从一个变化源沿反向引用 BFS。
+// 返回 Map<受影响条款, {distance, path, edges}>：
+//   path  为条款链 [受影响条款, ..., 变化源]，相邻条款间存在前向引用；
+//   edges 为 path 上每一跳的引用（与 path 等长 - 1，同序）。
+// BFS 首次到达即最短；同一对条款间存在多条不同标签引用时取序号最前者，结果确定。
+function reverseReachable(state, seed) {
+  const incoming = buildIncoming(state);
+  const dist = new Map([[seed, 0]]);
+  const parent = new Map(); // node -> {parent, edge}
+  const queue = [seed];
+  for (let i = 0; i < queue.length; i++) {
+    const v = queue[i];
+    for (const e of incoming.get(v) || []) {
+      if (!dist.has(e.source)) {
+        dist.set(e.source, dist.get(v) + 1);
+        parent.set(e.source, { parent: v, edge: e });
+        queue.push(e.source);
+      }
+    }
+  }
+  const out = new Map();
+  for (const [node, distance] of dist) {
+    if (distance === 0) continue;
+    const path = [node];
+    const edges = [];
+    let cur = node;
+    while (cur !== seed) {
+      const p = parent.get(cur);
+      edges.push(p.edge);
+      path.push(p.parent);
+      cur = p.parent;
+    }
+    out.set(node, { distance, path, edges });
+  }
+  return out;
+}
+
+function referenceImpact({ latest, candidate }) {
+  const candEdgeKeys = new Set(candidate.edges.map(edgeKey));
+
+  // 1) 变化源
+  const sources = [];
+  const sourceKind = new Map();
+  const addSource = (s) => {
+    sources.push(s);
+    sourceKind.set(s.key, s.kind);
+  };
+  for (const key of latest.order) {
+    const l = latest.clauses.get(key);
+    const c = candidate.clauses.get(key);
+    if (!c) {
+      addSource({
+        key,
+        kind: 'deleted',
+        changes: { title: true, body: true, outgoing_refs: true },
+        title_before: l.title,
+        title_after: null,
+        body_before: l.body,
+        body_after: null,
+        outgoing_added: [],
+        outgoing_removed: edgesOf(latest, key).map((e) => ({ ...e })),
+      });
+      continue;
+    }
+    const oldOut = edgesOf(latest, key);
+    const newOut = edgesOf(candidate, key);
+    const titleChanged = l.title !== c.title;
+    const bodyChanged = l.body !== c.body;
+    const refsChanged = !edgeSetsEqual(oldOut, newOut);
+    if (!titleChanged && !bodyChanged && !refsChanged) continue;
+    const oldKeys = new Set(oldOut.map(edgeKey));
+    const newKeys = new Set(newOut.map(edgeKey));
+    addSource({
+      key,
+      kind: 'modified',
+      changes: { title: titleChanged, body: bodyChanged, outgoing_refs: refsChanged },
+      title_before: l.title,
+      title_after: c.title,
+      body_before: l.body,
+      body_after: c.body,
+      outgoing_added: newOut.filter((e) => !oldKeys.has(edgeKey(e))).map((e) => ({ ...e })),
+      outgoing_removed: oldOut.filter((e) => !newKeys.has(edgeKey(e))).map((e) => ({ ...e })),
+    });
+  }
+  // 排序：候选版中仍存在的按候选顺序，删除源按最新版顺序（稳定、确定）
+  sources.sort((a, b) => {
+    const ia = candidate.clauses.has(a.key) ? candidate.order.indexOf(a.key) : Infinity;
+    const ib = candidate.clauses.has(b.key) ? candidate.order.indexOf(b.key) : Infinity;
+    if (ia !== ib) return ia - ib;
+    return latest.order.indexOf(a.key) - latest.order.indexOf(b.key);
+  });
+
+  // 2) 分别沿两版各自的反向引用追溯
+  const relationsByNode = new Map();
+  const consider = (side, state, seedKey) => {
+    const reached = reverseReachable(state, seedKey);
+    for (const [node, info] of reached) {
+      if (sourceKind.has(node)) continue; // 变化源单独展示，不互为“受影响条款”
+      if (!candidate.clauses.has(node)) continue; // 只展示候选版中仍存在的受影响条款
+      const path = info.path.map((k) => ({ key: k, exists_after: candidate.clauses.has(k) }));
+      const edges = info.edges.map((e) => ({
+        source: e.source,
+        target: e.target,
+        label: e.label || '',
+        exists_after: candEdgeKeys.has(edgeKey(e)),
+      }));
+      // 变化前的链：若链上任一节点或引用在候选版已消失，则该链在变化后不再完整存续
+      const active_after =
+        side === 'after' || (path.every((n) => n.exists_after) && edges.every((e) => e.exists_after));
+      if (!relationsByNode.has(node)) relationsByNode.set(node, []);
+      relationsByNode.get(node).push({
+        side,
+        source_key: seedKey,
+        source_kind: sourceKind.get(seedKey),
+        distance: info.distance,
+        direct: info.distance === 1,
+        active_after,
+        path,
+        edges,
+      });
+    }
+  };
+  for (const s of sources) {
+    if (latest.clauses.has(s.key)) consider('before', latest, s.key);
+    if (candidate.clauses.has(s.key)) consider('after', candidate, s.key);
+  }
+
+  // 3) 合并展示：受影响条款按候选版顺序，关系按距离/前后版排序
+  const affected = candidate.order.filter((k) => relationsByNode.has(k)).map((key) => {
+    const relations = relationsByNode.get(key);
+    relations.sort((a, b) => {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      if (a.side !== b.side) return a.side === 'after' ? -1 : 1;
+      return a.source_key < b.source_key ? -1 : a.source_key > b.source_key ? 1 : 0;
+    });
+    const c = candidate.clauses.get(key);
+    return {
+      key,
+      title: c.title,
+      ordinal: candidate.order.indexOf(key),
+      direct: relations.some((r) => r.direct),
+      indirect: relations.some((r) => !r.direct),
+      sides: [...new Set(relations.map((r) => r.side))],
+      source_keys: sources.map((s) => s.key).filter((k) => relations.some((r) => r.source_key === k)),
+      relations,
+    };
+  });
+
+  return { sources, affected };
+}
+
+// ---------------------------------------------------------------------------
 // 正文 token 级差异（LCS），中文按字切分
 // ---------------------------------------------------------------------------
 function tokenize(text) {
@@ -526,6 +696,7 @@ module.exports = {
   hasBlockingIssues,
   diffStates,
   textDiff,
+  referenceImpact,
   buildState,
   edgesOf,
   edgeKey,

@@ -639,7 +639,13 @@ function renderDiffSummary(d) {
     class: 'btn ghost small', style: 'margin-top:8px',
     onclick: () => openDiffDetail(d),
   }, '查看相对基线 v' + d.baseline_id + ' 的正文差异');
-  return el('div', {}, box, detailBtn);
+
+  // 引用影响链（只读实时分析：候选版本 vs 最新发布版）
+  const impactBtn = el('button', {
+    class: 'btn ghost small', style: 'margin-top:8px',
+    onclick: () => openImpact(d.id),
+  }, '🔗 查看引用影响链（候选版重放后对最新版的引用影响）');
+  return el('div', {}, box, detailBtn, impactBtn);
 }
 
 function renderDraftClause(d, c, i) {
@@ -838,6 +844,152 @@ function openDiffDetail(d) {
     for (const r of diff.refs_added || []) body.appendChild(el('div', {}, el('ins', {}, `${r.source} → ${r.target}${r.label ? '（' + r.label + '）' : ''}`)));
   }
   modal({ title: `相对基线 v${d.baseline_id} 的差异`, body, wide: true, footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')] });
+}
+
+// ---------------------------------------------------------------------------
+// 引用影响链：草案按现有规则重放后的候选版本 vs 最新发布版
+// ---------------------------------------------------------------------------
+async function openImpact(draftId) {
+  let p;
+  try {
+    p = await api('GET', `/api/drafts/${draftId}/impact`);
+  } catch (e) {
+    const data = e.payload || {};
+    if (data && (data.blocked || data.error)) {
+      renderImpactModal(data, true);
+      return;
+    }
+    toast(e.message, 'err');
+    return;
+  }
+  renderImpactModal(p, false);
+}
+
+function impactHeaderInfo(p, blocked) {
+  return el('div', { class: 'muted small', style: 'margin:6px 0 12px;line-height:1.9' },
+    el('span', { class: 'key-chip' }, `草案修订号 #${p.draft_revision ?? '-'}`),
+    ' ',
+    el('span', { class: 'key-chip' }, `最新发布版 v${p.latest_version_id ?? '-'}`),
+    ' ',
+    el('span', { class: 'muted small' }, `基线 v${p.baseline_id}${p.replayed ? '（候选版本已按现有规则重放到最新版）' : ''}`),
+    ' ',
+    el('span', { class: 'muted small' }, `查询时刻 ${fmtTime(p.queried_at)}（只读，实时重算）`),
+    blocked ? null : el('div', { class: 'muted small', style: 'margin-top:4px' },
+      `变化源 ${p.source_count} 个 · 仍存在的受影响条款 ${p.affected_count} 个；循环引用不重复追溯，变化前后的引用链各自独立、绝不跨版拼接。`),
+  );
+}
+
+const IMPACT_REASON = {
+  NO_PUBLISHED_VERSION: '还没有已发布版本',
+  DRAFT_INVALID: '草案存在必须先修复的问题（如悬空引用、正文为空），无法重放',
+  REPLAY_CONFLICT: '基线落后，按现有规则重放时与最新发布版存在冲突',
+  REPLAY_DANGLING: '基线落后，重放后会产生悬空引用',
+};
+
+function renderImpactModal(p, blocked) {
+  const body = el('div', {});
+  body.appendChild(impactHeaderInfo(p, blocked));
+
+  if (blocked) {
+    body.appendChild(el('div', { class: 'issue error' }, el('span', {}, '⛔'),
+      el('div', {},
+        el('div', {}, el('strong', {}, `无法生成引用影响结论（${p.reason}）`)),
+        el('div', { class: 'small muted' }, p.message || IMPACT_REASON[p.reason] || '请先处理后重新查询。'),
+      )));
+    if (p.conflicts?.length || p.dangling?.length) body.appendChild(renderPublishConflict(p));
+    if (p.issues?.length) body.appendChild(renderIssueList(p.issues));
+    body.appendChild(el('div', { class: 'muted small', style: 'margin-top:8px' },
+      '该查询为只读操作，草案未被改动；修复后再次打开即可看到引用影响链。'));
+    modal({ title: `引用影响链 · ${p.draft_name || ''}`, body, wide: true, footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')] });
+    return;
+  }
+
+  if (!p.sources.length) {
+    body.appendChild(el('div', { class: 'empty' }, el('div', { class: 'big' }, '✅'), el('div', {}, '候选版本与最新发布版相比没有标题、正文或出站引用变化，也没有删除条款，无引用影响。')));
+    modal({ title: `引用影响链 · ${p.draft_name}`, body, wide: true, footer: [el('button', { class: 'btn ghost', onclick: closeModal }, '关闭')] });
+    return;
+  }
+
+  // 变化源
+  body.appendChild(el('h4', { style: 'margin:4px 0 8px' }, '变化源（标题/正文/出站引用变化或被删除）'));
+  for (const s of p.sources) {
+    const chips = [
+      s.changes.title ? el('span', { class: 'badge warn' }, '标题变化') : null,
+      s.changes.body ? el('span', { class: 'badge warn' }, '正文变化') : null,
+      s.changes.outgoing_refs ? el('span', { class: 'badge neutral' }, '出站引用变化') : null,
+    ];
+    body.appendChild(el('div', { class: `clause ${s.kind === 'deleted' ? 'deleted-glow' : 'changed-glow'}` },
+      el('div', { class: 'clause-hd' },
+        el('span', { class: 'key-chip' }, s.key),
+        el('span', { class: 'title' }, s.kind === 'deleted'
+          ? (s.title_before || '（已删除条款）')
+          : (s.title_after || '')),
+        s.kind === 'deleted' ? el('span', { class: 'badge err' }, '已删除') : null,
+        ...chips,
+      ),
+      (s.outgoing_added?.length || s.outgoing_removed?.length)
+        ? el('div', { class: 'clause-bd' },
+          s.outgoing_removed?.length ? el('div', { class: 'small' }, '删除出站引用：',
+            ...s.outgoing_removed.map((r) => el('del', { style: 'margin-right:8px' }, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`))) : null,
+          s.outgoing_added?.length ? el('div', { class: 'small' }, '新增出站引用：',
+            ...s.outgoing_added.map((r) => el('ins', { style: 'margin-right:8px' }, `${r.source} → ${r.target}${r.label ? `（${r.label}）` : ''}`))) : null,
+        )
+        : null,
+    ));
+  }
+
+  // 受影响条款
+  body.appendChild(el('h4', { style: 'margin:16px 0 8px' },
+    '仍存在的受影响条款（沿变化前后各自的反向引用追溯，含直接/间接关系与最短引用链）'));
+  if (!p.affected.length) {
+    body.appendChild(el('div', { class: 'empty small' }, '没有任何现存条款通过引用链指向上述变化源。'));
+  }
+  for (const a of p.affected) {
+    const box = el('div', { class: 'clause' });
+    box.appendChild(el('div', { class: 'clause-hd' },
+      el('span', { class: 'key-chip' }, a.key),
+      el('span', { class: 'title' }, a.title),
+      a.direct ? el('span', { class: 'badge warn' }, '直接引用') : null,
+      a.indirect ? el('span', { class: 'badge neutral' }, '间接引用') : null,
+      a.sides.includes('before') && a.sides.includes('after') ? el('span', { class: 'badge open' }, '变化前后均可达') : null,
+    ));
+    const bd = el('div', { class: 'clause-bd impact-rel-list' });
+    for (const r of a.relations) {
+      const sideLabel = r.side === 'before' ? '变化前（最新版）' : '变化后（候选版）';
+      const head = el('div', { class: 'impact-rel-head small' },
+        el('span', { class: `badge ${r.side === 'before' ? 'neutral' : 'ok'}` }, sideLabel),
+        ` 到变化源 `,
+        el('span', { class: 'key-chip' }, r.source_key),
+        ` · ${r.distance === 1 ? '直接' : `间接 · ${r.distance} 跳`} · 最短链`,
+        r.side === 'before' && !r.active_after ? el('span', { class: 'badge err', style: 'margin-left:6px' }, '该链在候选版已不完整') : null,
+      );
+      const chain = el('div', { class: 'impact-chain' });
+      r.path.forEach((node, i) => {
+        const isSource = i === r.path.length - 1;
+        chain.appendChild(el('span', {
+          class: `key-chip ${isSource ? 'impact-source' : ''} ${node.exists_after ? '' : 'gone'}`,
+          title: node.exists_after ? '' : '该条款在候选版本中已删除',
+        }, node.key + (isSource ? '（变化源）' : '')));
+        if (i < r.path.length - 1) {
+          const edge = r.edges[i];
+          chain.appendChild(el('span', {
+            class: `impact-arrow ${edge.exists_after ? '' : 'gone'}`,
+            title: edge.exists_after ? '' : '该引用在候选版本中已删除',
+          }, edge.label ? ` →${edge.label}→ ` : ' → '));
+        }
+      });
+      bd.appendChild(head);
+      bd.appendChild(chain);
+    }
+    box.appendChild(bd);
+    body.appendChild(box);
+  }
+
+  modal({ title: `引用影响链 · ${p.draft_name}（候选版 vs v${p.latest_version_id}）`, body, wide: true,
+    footer: [
+      el('button', { class: 'btn secondary', onclick: () => { closeModal(); openImpact(p.draft_id); } }, '重新查询'),
+      el('button', { class: 'btn ghost', onclick: closeModal }, '关闭'),
+    ] });
 }
 
 function openPublish(draftId) {
